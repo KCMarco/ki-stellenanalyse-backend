@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>KI-Stellenanzeigen-Check</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body {
+      background: #020617;
+      color: #e5e7eb;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 0;
+    }
+    .wrapper {
+      max-width: 900px;
+      margin: 40px auto;
+      padding: 0 16px;
+    }
+    .card {
+      background: #020617;
+      border-radius: 16px;
+      border: 1px solid #1f2937;
+      padding: 24px;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+    }
+    textarea {
+      width: 100%;
+      box-sizing: border-box;
+      border-radius: 12px;
+      border: 1px solid #1f2937;
+      background: #020617;
+      color: #e5e7eb;
+      padding: 10px 12px;
+      font-size: 14px;
+      resize: vertical;
+      min-height: 220px;
+    }
+    textarea:focus {
+      outline: none;
+      border-color: #0ea5e9;
+      box-shadow: 0 0 0 1px #0ea5e9;
+    }
+    button {
+      width: 100%;
+      height: 44px;
+      border-radius: 999px;
+      border: none;
+      margin-top: 12px;
+      background: linear-gradient(90deg, #0ea5e9, #2563eb);
+      color: white;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: transform 0.1s ease, opacity 0.1s ease;
+    }
+    button:hover {
+      opacity: 0.9;
+      transform: translateY(-1px);
+    }
+    button:active {
+      transform: translateY(0);
+    }
+    button[disabled] {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+    .label {
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+    .hint {
+      font-size: 12px;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+    .error {
+      margin-top: 10px;
+      font-size: 13px;
+      color: #fca5a5;
+      display: none;
+    }
+    .section-title {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .section {
+      margin-top: 18px;
+    }
+    ul {
+      padding-left: 18px;
+      margin: 4px 0 0 0;
+      font-size: 13px;
+    }
+    ul li {
+      margin-bottom: 3px;
+    }
+    #resultSection {
+      margin-top: 24px;
+      border-top: 1px solid #1f2937;
+      padding-top: 18px;
+      display: none;
+    }
+    #improvedAd {
+      min-height: 160px;
+    }
+    h1 {
+      font-size: 26px;
+      margin-bottom: 4px;
+    }
+    .subtitle {
+      font-size: 14px;
+      color: #9ca3af;
+    }
+    footer {
+      margin-top: 18px;
+      text-align: center;
+      font-size: 11px;
+      color: #6b7280;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <div style="text-align:center;margin-bottom:20px;">
+      <h1>KI-Stellenanzeigen-Check</h1>
+      <p class="subtitle">Füge deine Stellenanzeige ein und erhalte Analyse & Verbesserungsvorschläge.</p>
+    </div>
+
+    <div class="card">
+      <!-- Eingabe -->
+      <div>
+        <div class="label">Stellenanzeige</div>
+        <textarea id="jobText" placeholder="Füge hier den kompletten Text deiner Stellenanzeige ein…"></textarea>
+        <div class="hint">
+          Tipp: Kopiere die Anzeige mit Aufgaben, Profil, Benefits etc.
+        </div>
+      </div>
+
+      <!-- Button -->
+      <button id="analyzeBtn">
+        <span id="btnLabel">Anzeige analysieren</span>
+        <span id="btnSpinner" style="display:none;">Wird analysiert…</span>
+      </button>
+
+      <!-- Fehler -->
+      <div id="errorBox" class="error"></div>
+
+      <!-- Ergebnis -->
+      <div id="resultSection">
+        <div class="section">
+          <div class="section-title">Kurz-Zusammenfassung</div>
+          <p id="summary" style="font-size:13px;margin-top:2px;"></p>
+        </div>
+
+        <div class="section">
+          <div class="section-title">Stärken</div>
+          <ul id="strengths"></ul>
+        </div>
+
+        <div class="section">
+          <div class="section-title">Optimierungspotenziale</div>
+          <ul id="issues"></ul>
+        </div>
+
+        <div class="section">
+          <div class="section-title">Konkrete Verbesserungsvorschläge</div>
+          <ul id="suggestions"></ul>
+        </div>
+
+        <div class="section">
+          <div class="section-title">Überarbeitete Stellenanzeige (Vorschlag)</div>
+          <textarea id="improvedAd"></textarea>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      Kconsulting GmbH – KI-gestütztes Recruiting
+    </footer>
+  </div>
+
+  <script>
+    const analyzeBtn = document.getElementById("analyzeBtn");
+    const btnLabel = document.getElementById("btnLabel");
+    const btnSpinner = document.getElementById("btnSpinner");
+    const errorBox = document.getElementById("errorBox");
+    const resultSection = document.getElementById("resultSection");
+
+    const summaryEl = document.getElementById("summary");
+    const strengthsEl = document.getElementById("strengths");
+    const issuesEl = document.getElementById("issues");
+    const suggestionsEl = document.getElementById("suggestions");
+    const improvedAdEl = document.getElementById("improvedAd");
+
+    function setLoading(isLoading) {
+      analyzeBtn.disabled = isLoading;
+      btnLabel.style.display = isLoading ? "none" : "inline";
+      btnSpinner.style.display = isLoading ? "inline" : "none";
+    }
+
+    function renderList(ul, items) {
+      ul.innerHTML = "";
+      if (!Array.isArray(items)) return;
+      items.forEach((item) => {
+        const li = document.createElement("li");
+        li.textContent = item;
+        ul.appendChild(li);
+      });
+    }
+
+    analyzeBtn.addEventListener("click", async () => {
+      const jobText = document.getElementById("jobText").value.trim();
+      errorBox.style.display = "none";
+      errorBox.textContent = "";
+
+      if (!jobText) {
+        errorBox.textContent = "Bitte füge zuerst den Text deiner Stellenanzeige ein.";
+        errorBox.style.display = "block";
+        return;
+      }
+
+      setLoading(true);
+
+      try {
+        const res = await fetch("http://localhost:3000/api/analyze-job-ad", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ jobText }),
+        });
+
+        if (!res.ok) {
+          throw new Error("Fehler bei der Analyse. Bitte später erneut versuchen.");
+        }
+
+        const data = await res.json();
+
+        summaryEl.textContent = data.summary || "";
+        renderList(strengthsEl, data.strengths || []);
+        renderList(issuesEl, data.issues || []);
+        renderList(suggestionsEl, data.suggestions || []);
+        improvedAdEl.value = data.improvedAd || "";
+
+        resultSection.style.display = "block";
+        resultSection.scrollIntoView({ behavior: "smooth", block: "start" });
+      } catch (err) {
+        console.error(err);
+        errorBox.textContent = err.message || "Es ist ein unbekannter Fehler aufgetreten.";
+        errorBox.style.display = "block";
+      } finally {
+        setLoading(false);
+      }
+    });
+  </script>
+</body>
+</html>
