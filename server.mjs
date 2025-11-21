@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import jwt from "jsonwebtoken";
 
 dotenv.config();
 
@@ -12,6 +13,35 @@ app.use(express.json());
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
+
+// Login / JWT-Konfiguration
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const JWT_SECRET = process.env.JWT_SECRET || "change-me-in-env";
+
+// JWT erzeugen
+function generateToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
+}
+
+// Middleware: prüft, ob ein gültiger Token mitgeschickt wurde
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+
+  if (!token) {
+    return res.status(401).json({ error: "Nicht eingeloggt (Token fehlt)." });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; // falls du später z. B. email brauchst
+    next();
+  } catch (err) {
+    console.error("JWT-Fehler:", err);
+    return res.status(401).json({ error: "Ungültiger oder abgelaufener Token." });
+  }
+}
 
 // Hilfsfunktion: Text analysieren (Responses API, ohne response_format)
 async function analyzeJobAdText(rawInput, options = {}) {
@@ -118,8 +148,34 @@ app.get("/", (req, res) => {
   res.send("KI-Stellenanalyse Backend läuft.");
 });
 
+// Login-Endpunkt: gibt bei korrekten Zugangsdaten einen JWT-Token zurück
+app.post("/api/login", (req, res) => {
+  const { email, password } = req.body || {};
+
+  if (!email || !password) {
+    return res
+      .status(400)
+      .json({ error: "Email und Passwort sind erforderlich." });
+  }
+
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+    console.error("ADMIN_EMAIL oder ADMIN_PASSWORD nicht gesetzt.");
+    return res
+      .status(500)
+      .json({ error: "Login ist aktuell nicht konfiguriert." });
+  }
+
+  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: "Ungültige Zugangsdaten." });
+  }
+
+  const token = generateToken({ email });
+  res.json({ token });
+});
+
+
 // 1) Analyse über direkten Text
-app.post("/api/analyze-job-ad", async (req, res) => {
+app.post("/api/analyze-job-ad", authMiddleware, async (req, res) => {
   try {
     const { jobText } = req.body;
 
@@ -143,7 +199,7 @@ app.post("/api/analyze-job-ad", async (req, res) => {
 });
 
 // 2) Analyse über URL (HTML laden & analysieren)
-app.post("/api/analyze-job-ad-from-url", async (req, res) => {
+app.post("/api/analyze-job-ad-from-url", authMiddleware, async (req, res) => {
   try {
     const { url } = req.body;
 
