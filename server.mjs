@@ -94,18 +94,27 @@ Input:
   const response = await client.responses.create({
     model: "gpt-4.1",
     input: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
+      {
+        role: "system",
+        content: systemPrompt
+      },
+      {
+        role: "user",
+        content: userPrompt
+      }
     ],
-    response_format: {
+
+    // ⭐ NEUE Responses API Syntax ⭐
+    format: {
       type: "json_schema",
-      json_schema: analysisSchema,
-    },
+      json_schema: analysisSchema
+    }
   });
 
+  // Responses API Rückgabeformat
   const rawText =
-    response.output?.[0]?.content?.[0]?.text ??
     response.output_text ??
+    response.output?.[0]?.content?.[0]?.text ??
     "";
 
   let json;
@@ -113,8 +122,18 @@ Input:
     json = JSON.parse(rawText);
   } catch (err) {
     console.error("JSON-Parse-Fehler:", err, rawText);
-    throw new Error("Die KI-Antwort konnte nicht als JSON interpretiert werden.");
+    throw new Error("Die KI-Antwort konnte nicht als JSON verarbeitet werden.");
   }
+
+  return {
+    summary: json.summary ?? "",
+    strengths: json.strengths ?? [],
+    issues: json.issues ?? [],
+    suggestions: json.suggestions ?? [],
+    improvedAd: json.improvedAd ?? "",
+    score: json.score ?? {}
+  };
+
 
   return {
     summary: json.summary || "",
@@ -173,27 +192,58 @@ app.post("/api/analyze-job-ad-from-url", async (req, res) => {
         .json({ error: "url fehlt oder ist ungültig." });
     }
 
+    // Basic-Check: URL muss mit http(s) beginnen
+    if (!/^https?:\/\//i.test(url)) {
+      return res
+        .status(400)
+        .json({ error: "Bitte gib eine vollständige URL inkl. http(s) an." });
+    }
+
     let response;
     try {
       response = await fetch(url, { redirect: "follow" });
     } catch (fetchErr) {
       console.error("Fetch-Fehler:", fetchErr);
-      return res
-        .status(500)
-        .json({ error: "Die Seite konnte nicht geladen werden." });
+      return res.status(500).json({
+        error:
+          "Die Seite konnte nicht geladen werden (Netzwerk-/SSL-Fehler). Bitte probiere eine andere URL oder füge den Text direkt ein.",
+      });
     }
 
     if (!response.ok) {
+      console.error("HTTP-Fehler beim Laden der URL:", response.status);
       return res.status(500).json({
         error: `Die Seite konnte nicht geladen werden (HTTP ${response.status}).`,
       });
     }
 
-    const html = await response.text();
+    let html;
+    try {
+      html = await response.text();
+    } catch (readErr) {
+      console.error("Fehler beim Lesen des HTML:", readErr);
+      return res.status(500).json({
+        error:
+          "Der Inhalt der Seite konnte nicht gelesen werden. Bitte füge den Anzeigentext direkt ein.",
+      });
+    }
 
-    const result = await analyzeJobAdText(html, {
-      source: `HTML von ${url}`,
-    });
+    // HTML auf sinnvolle Länge kürzen (z. B. 50.000 Zeichen),
+    // damit OpenAI nicht mit zu viel Markup zugemüllt wird
+    const trimmedHtml = html.slice(0, 50000);
+
+    let result;
+    try {
+      result = await analyzeJobAdText(trimmedHtml, {
+        source: `HTML von ${url}`,
+      });
+    } catch (aiErr) {
+      console.error("OpenAI-/Analyse-Fehler:", aiErr);
+      return res.status(500).json({
+        error:
+          "Die KI konnte die Stellenanzeige von dieser URL nicht verarbeiten. Bitte füge den Text direkt ein.",
+      });
+    }
 
     res.json(result);
   } catch (err) {
@@ -203,6 +253,7 @@ app.post("/api/analyze-job-ad-from-url", async (req, res) => {
     });
   }
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
