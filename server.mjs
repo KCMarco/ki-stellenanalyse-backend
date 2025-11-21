@@ -13,53 +13,7 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// JSON-Schema für die Responses API
-const analysisSchema = {
-  name: "job_ad_analysis",
-  schema: {
-    type: "object",
-    properties: {
-      summary: { type: "string" },
-      strengths: {
-        type: "array",
-        items: { type: "string" },
-      },
-      issues: {
-        type: "array",
-        items: { type: "string" },
-      },
-      suggestions: {
-        type: "array",
-        items: { type: "string" },
-      },
-      improvedAd: { type: "string" },
-      score: {
-        type: "object",
-        properties: {
-          overall: { type: "number" },
-          clarity: { type: "number" },
-          attractiveness: { type: "number" },
-          structure: { type: "number" },
-          social_media_effectiveness: { type: "number" },
-        },
-        required: ["overall"],
-        additionalProperties: false,
-      },
-    },
-    required: [
-      "summary",
-      "strengths",
-      "issues",
-      "suggestions",
-      "improvedAd",
-      "score",
-    ],
-    additionalProperties: false,
-  },
-  strict: true,
-};
-
-// Hilfsfunktion: Text analysieren (Responses API)
+// Hilfsfunktion: Text analysieren (Responses API, ohne response_format)
 async function analyzeJobAdText(rawInput, options = {}) {
   const { source = "Direkter Text" } = options;
 
@@ -81,7 +35,37 @@ Deine Aufgaben:
 3. Vergib Scores (0–100).
 4. Erstelle eine komplett optimierte Version der Anzeige.
 
-Gib die Antwort STRICT im JSON-Format des Schema aus. Keine zusätzlichen Felder.
+WICHTIG:
+- Antworte AUSSCHLIESSLICH mit gültigem JSON.
+- KEIN Fließtext außerhalb des JSON.
+- KEIN Markdown, KEINE Erklärungen.
+- Verwende GENAU dieses JSON-Format:
+
+{
+  "summary": "Kurz-Zusammenfassung der Anzeige.",
+  "strengths": [
+    "Punkt 1",
+    "Punkt 2"
+  ],
+  "issues": [
+    "Punkt 1",
+    "Punkt 2"
+  ],
+  "suggestions": [
+    "Punkt 1",
+    "Punkt 2"
+  ],
+  "improvedAd": "Vollständig überarbeitete Stellenanzeige als Fließtext.",
+  "score": {
+    "overall": 83,
+    "clarity": 85,
+    "attractiveness": 80,
+    "structure": 82,
+    "social_media_effectiveness": 84
+  }
+}
+
+Halte dich strikt an diese Struktur. Alle Felder müssen vorhanden sein.
 `;
 
   const userPrompt = `
@@ -94,24 +78,11 @@ Input:
   const response = await client.responses.create({
     model: "gpt-4.1",
     input: [
-      {
-        role: "system",
-        content: systemPrompt
-      },
-      {
-        role: "user",
-        content: userPrompt
-      }
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
     ],
-
-    // ⭐ NEUE Responses API Syntax ⭐
-    format: {
-      type: "json_schema",
-      json_schema: analysisSchema
-    }
   });
 
-  // Responses API Rückgabeformat
   const rawText =
     response.output_text ??
     response.output?.[0]?.content?.[0]?.text ??
@@ -122,18 +93,8 @@ Input:
     json = JSON.parse(rawText);
   } catch (err) {
     console.error("JSON-Parse-Fehler:", err, rawText);
-    throw new Error("Die KI-Antwort konnte nicht als JSON verarbeitet werden.");
+    throw new Error("Die KI-Antwort konnte nicht als JSON interpretiert werden.");
   }
-
-  return {
-    summary: json.summary ?? "",
-    strengths: json.strengths ?? [],
-    issues: json.issues ?? [],
-    suggestions: json.suggestions ?? [],
-    improvedAd: json.improvedAd ?? "",
-    score: json.score ?? {}
-  };
-
 
   return {
     summary: json.summary || "",
@@ -228,8 +189,7 @@ app.post("/api/analyze-job-ad-from-url", async (req, res) => {
       });
     }
 
-    // HTML auf sinnvolle Länge kürzen (z. B. 50.000 Zeichen),
-    // damit OpenAI nicht mit zu viel Markup zugemüllt wird
+    // HTML auf sinnvolle Länge kürzen
     const trimmedHtml = html.slice(0, 50000);
 
     let result;
@@ -253,7 +213,6 @@ app.post("/api/analyze-job-ad-from-url", async (req, res) => {
     });
   }
 });
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
