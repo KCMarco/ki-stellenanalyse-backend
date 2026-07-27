@@ -3,28 +3,72 @@ import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
+import { createClient } from "@supabase/supabase-js";
+import { Resend } from "resend";
+import crypto from "crypto";
 
 dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Login / JWT-Konfiguration
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 const JWT_SECRET = process.env.JWT_SECRET || "change-me-in-env";
 
-// JWT erzeugen
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM = process.env.RESEND_FROM || "Kconsulting KI-Stellenanalyse <onboarding@resend.dev>";
+const APP_LOGIN_URL = process.env.APP_LOGIN_URL || "https://ki-stellenanalyse.webflow.io/login";
+
+const supabase =
+  SUPABASE_URL && SUPABASE_SECRET_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      })
+    : null;
+
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+
+const PLAN_INFO = {
+  free: { name: "Free (Demo)", monthlyLimit: 3 },
+  pro: { name: "Pro", monthlyLimit: 50 },
+  enterprise: { name: "Enterprise", monthlyLimit: 350 },
+};
+
+function currentUsageMonth() {
+  return new Date().toISOString().slice(0, 7);
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function generateTemporaryPassword() {
+  // 12 Zeichen, gut lesbar und mit Groß-/Kleinbuchstaben sowie Zahlen.
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  let password = "";
+  for (let i = 0; i < 12; i += 1) {
+    password += alphabet[crypto.randomInt(0, alphabet.length)];
+  }
+  return password;
+}
+
 function generateToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
 }
 
-// Middleware: prüft, ob ein gültiger Token mitgeschickt wurde
 function authMiddleware(req, res, next) {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
@@ -34,8 +78,7 @@ function authMiddleware(req, res, next) {
   }
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded; // falls du später z. B. email brauchst
+    req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch (err) {
     console.error("JWT-Fehler:", err);
@@ -43,7 +86,152 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// Hilfsfunktion: Text analysieren (Responses API, ohne response_format)
+async function getUserById(userId) {
+  if (!supabase || !userId) return null;
+
+  const { data, error } = await supabase
+    .from("users")
+    .select("id,email,password_hash,plan,analyses_used,usage_month,is_active,created_at")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+async function getUserByEmail(email) {
+  if (!supabase) return null;
+
+  const { data, error } = await supabase
+    .from("users")
+    .select("id,email,password_hash,plan,analyses_used,usage_month,is_active,created_at")
+    .eq("email", email)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data;
+}
+
+async function refreshMonthlyUsage(user) {
+  const month = currentUsageMonth();
+  if (!user || user.usage_month === month) return user;
+
+  const { data, error } = await supabase
+    .from("users")
+    .update({
+      analyses_used: 0,
+      usage_month: month,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", user.id)
+    .select("id,email,password_hash,plan,analyses_used,usage_month,is_active,created_at")
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function requireActiveDatabaseUser(req, res) {
+  if (req.user?.isAdmin) {
+    return {
+      id: null,
+      email: req.user.email,
+      plan: "enterprise",
+      analyses_used: 0,
+      usage_month: currentUsageMonth(),
+      is_active: true,
+      isAdmin: true,
+    };
+  }
+
+  if (!supabase) {
+    res.status(500).json({ error: "Benutzerdatenbank ist nicht konfiguriert." });
+    return null;
+  }
+
+  let user = await getUserById(req.user?.userId);
+  if (!user || !user.is_active) {
+    res.status(401).json({ error: "Benutzerkonto nicht gefunden oder deaktiviert." });
+    return null;
+  }
+
+  user = await refreshMonthlyUsage(user);
+  return user;
+}
+
+function usagePayload(user) {
+  const planKey = PLAN_INFO[user.plan] ? user.plan : "free";
+  const planInfo = PLAN_INFO[planKey];
+  const used = Number(user.analyses_used || 0);
+
+  return {
+    plan: planKey,
+    monthlyLimit: planInfo.monthlyLimit,
+    remainingThisMonth: Math.max(0, planInfo.monthlyLimit - used),
+  };
+}
+
+async function ensureUsageAvailable(req, res) {
+  const user = await requireActiveDatabaseUser(req, res);
+  if (!user) return null;
+  if (user.isAdmin) return user;
+
+  const planKey = PLAN_INFO[user.plan] ? user.plan : "free";
+  const limit = PLAN_INFO[planKey].monthlyLimit;
+  if (Number(user.analyses_used || 0) >= limit) {
+    res.status(429).json({
+      error: `Dein monatliches Analyse-Limit von ${limit} ist erreicht.`,
+      usage: usagePayload(user),
+    });
+    return null;
+  }
+
+  return user;
+}
+
+async function incrementUsage(user) {
+  if (!user || user.isAdmin) return user;
+
+  const nextUsed = Number(user.analyses_used || 0) + 1;
+  const { data, error } = await supabase
+    .from("users")
+    .update({ analyses_used: nextUsed, updated_at: new Date().toISOString() })
+    .eq("id", user.id)
+    .select("id,email,plan,analyses_used,usage_month,is_active")
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function sendWelcomeEmail(email, temporaryPassword) {
+  if (!resend) {
+    throw new Error("RESEND_API_KEY ist nicht konfiguriert.");
+  }
+
+  const { error } = await resend.emails.send({
+    from: RESEND_FROM,
+    to: email,
+    subject: "Dein Zugang zur KI-Stellenanalyse",
+    html: `
+      <div style="font-family:Arial,sans-serif;line-height:1.6;color:#0f172a;max-width:620px;margin:auto">
+        <h2 style="color:#1776d4">Willkommen bei der Kconsulting KI-Stellenanalyse</h2>
+        <p>Dein kostenloser Testzugang wurde erfolgreich erstellt.</p>
+        <p><strong>E-Mail:</strong> ${email}</p>
+        <p><strong>Vorläufiges Passwort:</strong></p>
+        <div style="font-size:22px;font-weight:700;letter-spacing:2px;background:#eef6ff;border-radius:10px;padding:14px 18px;display:inline-block">${temporaryPassword}</div>
+        <p>Damit stehen dir im Free-Plan bis zu <strong>3 Analysen pro Monat</strong> zur Verfügung.</p>
+        <p><a href="${APP_LOGIN_URL}" style="display:inline-block;background:#1776d4;color:white;text-decoration:none;padding:12px 20px;border-radius:999px">Jetzt einloggen</a></p>
+        <p style="font-size:12px;color:#64748b">Bitte bewahre das Passwort sicher auf. Eine Passwort-ändern-Funktion ergänzen wir im nächsten Ausbauschritt.</p>
+      </div>
+    `,
+  });
+
+  if (error) {
+    throw new Error(error.message || "E-Mail konnte nicht versendet werden.");
+  }
+}
+
 async function analyzeJobAdText(rawInput, options = {}) {
   const { source = "Direkter Text" } = options;
 
@@ -73,18 +261,9 @@ WICHTIG:
 
 {
   "summary": "Kurz-Zusammenfassung der Anzeige.",
-  "strengths": [
-    "Punkt 1",
-    "Punkt 2"
-  ],
-  "issues": [
-    "Punkt 1",
-    "Punkt 2"
-  ],
-  "suggestions": [
-    "Punkt 1",
-    "Punkt 2"
-  ],
+  "strengths": ["Punkt 1", "Punkt 2"],
+  "issues": ["Punkt 1", "Punkt 2"],
+  "suggestions": ["Punkt 1", "Punkt 2"],
   "improvedAd": "Vollständig überarbeitete Stellenanzeige als Fließtext.",
   "score": {
     "overall": 83,
@@ -114,9 +293,7 @@ Input:
   });
 
   const rawText =
-    response.output_text ??
-    response.output?.[0]?.content?.[0]?.text ??
-    "";
+    response.output_text ?? response.output?.[0]?.content?.[0]?.text ?? "";
 
   let json;
   try {
@@ -143,77 +320,177 @@ Input:
   };
 }
 
-// Healthcheck
 app.get("/", (req, res) => {
   res.send("KI-Stellenanalyse Backend läuft.");
 });
 
-// Login-Endpunkt: gibt bei korrekten Zugangsdaten einen JWT-Token zurück
-app.post("/api/login", (req, res) => {
-  const { email, password } = req.body || {};
-
-  if (!email || !password) {
-    return res
-      .status(400)
-      .json({ error: "Email und Passwort sind erforderlich." });
-  }
-
-  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
-    console.error("ADMIN_EMAIL oder ADMIN_PASSWORD nicht gesetzt.");
-    return res
-      .status(500)
-      .json({ error: "Login ist aktuell nicht konfiguriert." });
-  }
-
-  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
-    return res.status(401).json({ error: "Ungültige Zugangsdaten." });
-  }
-
-  const token = generateToken({ email });
-  res.json({ token });
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    supabaseConfigured: Boolean(supabase),
+    emailConfigured: Boolean(resend),
+  });
 });
 
+app.post("/api/signup", async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
 
-// 1) Analyse über direkten Text
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: "Bitte gib eine gültige E-Mail-Adresse ein." });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({ error: "Registrierung ist aktuell nicht konfiguriert." });
+  }
+
+  try {
+    const existingUser = await getUserByEmail(email);
+    if (existingUser) {
+      return res.status(409).json({
+        error: "Für diese E-Mail-Adresse besteht bereits ein Zugang. Bitte nutze den Login.",
+      });
+    }
+
+    const temporaryPassword = generateTemporaryPassword();
+    const passwordHash = await bcrypt.hash(temporaryPassword, 12);
+
+    const { data: newUser, error: insertError } = await supabase
+      .from("users")
+      .insert({
+        email,
+        password_hash: passwordHash,
+        plan: "free",
+        analyses_used: 0,
+        usage_month: currentUsageMonth(),
+        is_active: true,
+      })
+      .select("id,email,plan")
+      .single();
+
+    if (insertError) throw insertError;
+
+    try {
+      await sendWelcomeEmail(email, temporaryPassword);
+    } catch (emailError) {
+      console.error("Willkommensmail fehlgeschlagen:", emailError);
+      await supabase.from("users").delete().eq("id", newUser.id);
+      return res.status(502).json({
+        error:
+          "Der Zugang konnte nicht per E-Mail zugestellt werden. Bitte versuche es später erneut.",
+      });
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: "Dein Passwort wurde per E-Mail versendet.",
+      user: { email: newUser.email, plan: newUser.plan },
+    });
+  } catch (err) {
+    console.error("Signup-Fehler:", err);
+    return res.status(500).json({ error: "Registrierung konnte nicht abgeschlossen werden." });
+  }
+});
+
+app.post("/api/login", async (req, res) => {
+  const email = normalizeEmail(req.body?.email);
+  const password = String(req.body?.password || "");
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "E-Mail und Passwort sind erforderlich." });
+  }
+
+  // Bestehender Admin-Zugang bleibt als Notfallzugang erhalten.
+  if (ADMIN_EMAIL && ADMIN_PASSWORD && email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
+    const token = generateToken({ email, isAdmin: true });
+    return res.json({
+      token,
+      user: { email, plan: "enterprise" },
+    });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({ error: "Login ist aktuell nicht konfiguriert." });
+  }
+
+  try {
+    let user = await getUserByEmail(email);
+    if (!user || !user.is_active) {
+      return res.status(401).json({ error: "Ungültige Zugangsdaten." });
+    }
+
+    const matches = await bcrypt.compare(password, user.password_hash);
+    if (!matches) {
+      return res.status(401).json({ error: "Ungültige Zugangsdaten." });
+    }
+
+    user = await refreshMonthlyUsage(user);
+    const token = generateToken({ userId: user.id, email: user.email });
+
+    return res.json({
+      token,
+      user: { email: user.email, plan: user.plan },
+    });
+  } catch (err) {
+    console.error("Login-Fehler:", err);
+    return res.status(500).json({ error: "Login konnte nicht durchgeführt werden." });
+  }
+});
+
+app.get("/api/me", authMiddleware, async (req, res) => {
+  try {
+    const user = await requireActiveDatabaseUser(req, res);
+    if (!user) return;
+
+    const planKey = PLAN_INFO[user.plan] ? user.plan : "free";
+    return res.json({
+      user: { email: user.email },
+      plan: planKey,
+      planInfo: PLAN_INFO[planKey],
+      analysesUsed: Number(user.analyses_used || 0),
+      usageMonth: user.usage_month,
+    });
+  } catch (err) {
+    console.error("/api/me-Fehler:", err);
+    return res.status(500).json({ error: "Benutzerdaten konnten nicht geladen werden." });
+  }
+});
+
 app.post("/api/analyze-job-ad", authMiddleware, async (req, res) => {
   try {
-    const { jobText } = req.body;
+    const user = await ensureUsageAvailable(req, res);
+    if (!user) return;
 
+    const { jobText } = req.body;
     if (!jobText || typeof jobText !== "string") {
-      return res
-        .status(400)
-        .json({ error: "jobText fehlt oder ist ungültig." });
+      return res.status(400).json({ error: "jobText fehlt oder ist ungültig." });
     }
 
     const result = await analyzeJobAdText(jobText.trim(), {
       source: "Direkt eingegebene Stellenanzeige",
     });
 
-    res.json(result);
+    const updatedUser = await incrementUsage(user);
+    return res.json({ ...result, usage: usagePayload(updatedUser) });
   } catch (err) {
     console.error("Fehler in /api/analyze-job-ad:", err);
-    res.status(500).json({
-      error: "Interner Serverfehler bei der Analyse.",
-    });
+    return res.status(500).json({ error: "Interner Serverfehler bei der Analyse." });
   }
 });
 
-// 2) Analyse über URL (HTML laden & analysieren)
 app.post("/api/analyze-job-ad-from-url", authMiddleware, async (req, res) => {
   try {
-    const { url } = req.body;
+    const user = await ensureUsageAvailable(req, res);
+    if (!user) return;
 
+    const { url } = req.body;
     if (!url || typeof url !== "string") {
-      return res
-        .status(400)
-        .json({ error: "url fehlt oder ist ungültig." });
+      return res.status(400).json({ error: "url fehlt oder ist ungültig." });
     }
 
-    // Basic-Check: URL muss mit http(s) beginnen
     if (!/^https?:\/\//i.test(url)) {
-      return res
-        .status(400)
-        .json({ error: "Bitte gib eine vollständige URL inkl. http(s) an." });
+      return res.status(400).json({
+        error: "Bitte gib eine vollständige URL inklusive http:// oder https:// an.",
+      });
     }
 
     let response;
@@ -223,50 +500,26 @@ app.post("/api/analyze-job-ad-from-url", authMiddleware, async (req, res) => {
       console.error("Fetch-Fehler:", fetchErr);
       return res.status(500).json({
         error:
-          "Die Seite konnte nicht geladen werden (Netzwerk-/SSL-Fehler). Bitte probiere eine andere URL oder füge den Text direkt ein.",
+          "Die Seite konnte nicht geladen werden. Bitte probiere eine andere URL oder füge den Text direkt ein.",
       });
     }
 
     if (!response.ok) {
-      console.error("HTTP-Fehler beim Laden der URL:", response.status);
       return res.status(500).json({
         error: `Die Seite konnte nicht geladen werden (HTTP ${response.status}).`,
       });
     }
 
-    let html;
-    try {
-      html = await response.text();
-    } catch (readErr) {
-      console.error("Fehler beim Lesen des HTML:", readErr);
-      return res.status(500).json({
-        error:
-          "Der Inhalt der Seite konnte nicht gelesen werden. Bitte füge den Anzeigentext direkt ein.",
-      });
-    }
+    const html = await response.text();
+    const result = await analyzeJobAdText(html.slice(0, 50000), {
+      source: `HTML von ${url}`,
+    });
 
-    // HTML auf sinnvolle Länge kürzen
-    const trimmedHtml = html.slice(0, 50000);
-
-    let result;
-    try {
-      result = await analyzeJobAdText(trimmedHtml, {
-        source: `HTML von ${url}`,
-      });
-    } catch (aiErr) {
-      console.error("OpenAI-/Analyse-Fehler:", aiErr);
-      return res.status(500).json({
-        error:
-          "Die KI konnte die Stellenanzeige von dieser URL nicht verarbeiten. Bitte füge den Text direkt ein.",
-      });
-    }
-
-    res.json(result);
+    const updatedUser = await incrementUsage(user);
+    return res.json({ ...result, usage: usagePayload(updatedUser) });
   } catch (err) {
     console.error("Fehler in /api/analyze-job-ad-from-url:", err);
-    res.status(500).json({
-      error: "Interner Serverfehler bei der URL-Analyse.",
-    });
+    return res.status(500).json({ error: "Interner Serverfehler bei der URL-Analyse." });
   }
 });
 
